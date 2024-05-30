@@ -1,98 +1,126 @@
-package pgtest_test
+package pgxtest
 
 import (
+	"context"
 	"os"
+	"path/filepath"
 	"testing"
-
-	"github.com/rubenv/pgtest"
-	"github.com/stretchr/testify/assert"
 )
 
 func TestPostgreSQL(t *testing.T) {
+	ctx := context.Background()
 	t.Parallel()
 
-	assert := assert.New(t)
+	pg, err := Start(ctx, Config{})
+	if err != nil {
+		t.Errorf("failed to start pgxtest: %v", err)
+	}
 
-	pg, err := pgtest.Start()
-	assert.NoError(err)
-	assert.NotNil(pg)
+	defer func() {
+		if err = pg.Stop(); err != nil {
+			t.Errorf("failed to stop pgxtest: %v", err)
+		}
+	}()
 
-	_, err = pg.DB.Exec("CREATE TABLE test (val text)")
-	assert.NoError(err)
+	if pg == nil {
+		t.Errorf("null pg returned unexpectedly")
+	}
 
-	err = pg.Stop()
-	assert.NoError(err)
+	conn, err := pg.Pool.Acquire(ctx)
+	if err != nil {
+		t.Errorf("failed to acquire a connection: %v", err)
+	}
+
+	defer conn.Release()
+
+	_, err = conn.Exec(ctx, "CREATE TABLE test (val text)")
+	if err != nil {
+		t.Errorf("failed to create table: %v", err)
+	}
 }
 
 func TestPostgreSQLWithConfig(t *testing.T) {
+	ctx := context.Background()
 	t.Parallel()
 
-	assert := assert.New(t)
-	pg, err := pgtest.New().From("/usr/bin/").Start()
-	assert.NoError(err)
-	assert.NotNil(pg)
+	var pgBinDir string
 
-	_, err = pg.DB.Exec("CREATE TABLE test (val text)")
-	assert.NoError(err)
+	for _, binDir := range []string{
+		"/usr/bin",
+		"/opt/homebrew/bin",
+		"/usr/lib/postgresql/16/bin",
+		"/usr/lib/postgresql/15/bin",
+		"/usr/lib/postgresql/14/bin",
+	} {
+		if _, err := os.Stat(filepath.Join(binDir, "postgres")); err == nil {
+			pgBinDir = binDir
+			break
+		}
+	}
 
-	assert.NotEmpty(pg.Host)
-	assert.NotEmpty(pg.Name)
+	if pgBinDir == "" {
+		t.Skip()
+	}
 
-	err = pg.Stop()
-	assert.NoError(err)
-}
+	pg, err := Start(ctx, Config{BinDir: pgBinDir})
+	if err != nil {
+		t.Errorf("failed to start pgxtest: %v", err)
+	}
+	defer func() {
+		if err = pg.Stop(); err != nil {
+			t.Errorf("failed to stop pgxtest: %v", err)
+		}
+	}()
 
-func TestPersistent(t *testing.T) {
-	t.Parallel()
+	if pg == nil {
+		t.Errorf("null pg returned unexpectedly")
+	}
 
-	assert := assert.New(t)
+	conn, err := pg.Pool.Acquire(ctx)
+	if err != nil {
+		t.Errorf("failed to acquire a connection: %v", err)
+	}
+	defer conn.Release()
 
-	dir, err := os.MkdirTemp("", "pgtest")
-	assert.NoError(err)
-	defer os.RemoveAll(dir)
+	if _, err = conn.Exec(ctx, "CREATE TABLE test (val text)"); err != nil {
+		t.Errorf("failed to create table: %v", err)
+	}
 
-	pg, err := pgtest.StartPersistent(dir)
-	assert.NoError(err)
-	assert.NotNil(pg)
-
-	_, err = pg.DB.Exec("CREATE TABLE test (val text)")
-	assert.NoError(err)
-
-	_, err = pg.DB.Exec("INSERT INTO test VALUES ('foo')")
-	assert.NoError(err)
-
-	err = pg.Stop()
-	assert.NoError(err)
-
-	// Open it again
-	pg, err = pgtest.StartPersistent(dir)
-	assert.NoError(err)
-	assert.NotNil(pg)
-
-	var val string
-	err = pg.DB.QueryRow("SELECT val FROM test").Scan(&val)
-	assert.NoError(err)
-	assert.Equal(val, "foo")
-
-	err = pg.Stop()
-	assert.NoError(err)
+	if pg.Host == "" || pg.Name == "" {
+		t.Errorf("pg.Host=%q or pg.Name=%q are empty", pg.Host, pg.Name)
+	}
 }
 
 func TestAdditionalArgs(t *testing.T) {
+	ctx := context.Background()
 	t.Parallel()
 
-	assert := assert.New(t)
+	pg, err := Start(ctx, Config{AdditionalArgs: []string{"-c", "wal_level=logical"}})
+	if err != nil {
+		t.Errorf("failed to start pgxtest: %v", err)
+	}
+	defer func() {
+		if err = pg.Stop(); err != nil {
+			t.Errorf("failed to stop pgxtest: %v", err)
+		}
+	}()
 
-	pg, err := pgtest.New().WithAdditionalArgs("-c", "wal_level=logical").Start()
-	assert.NoError(err)
-	assert.NotNil(pg)
+	if pg == nil {
+		t.Errorf("null pg returned unexpectedly")
+	}
+
+	conn, err := pg.Pool.Acquire(ctx)
+	if err != nil {
+		t.Errorf("failed to acquire a connection: %v", err)
+	}
+	defer conn.Release()
 
 	//Check if the wal_level is set to logical
 	var walLevel string
-	err = pg.DB.QueryRow("SHOW wal_level").Scan(&walLevel)
-	assert.NoError(err)
-	assert.Equal(walLevel, "logical")
-
-	err = pg.Stop()
-	assert.NoError(err)
+	if err := conn.QueryRow(ctx, "SHOW wal_level").Scan(&walLevel); err != nil {
+		t.Errorf("failed to SHOW wal_level: %v", err)
+	}
+	if walLevel != "logical" {
+		t.Errorf("expected walLevel 'logical', got %q", walLevel)
+	}
 }

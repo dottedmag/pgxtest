@@ -2,37 +2,67 @@
 // tests where you want a clean instance each time. Then clean up afterwards.
 //
 // Requires PostgreSQL to be installed on your system (but it doesn't have to be running).
-package pgtest
+package pgxtest
 
 import (
-	"database/sql"
+	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/exec"
-	"os/user"
 	"path"
 	"path/filepath"
-	"strconv"
-	"strings"
 	"time"
 
-	_ "github.com/lib/pq"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jackc/pgx/v5/tracelog"
+	pgxslog "github.com/mcosta74/pgx-slog"
 )
 
+type Config struct {
+	BinDir         string   // Directory to look for postgresql binaries including initdb, postgres
+	Dir            string   // Directory for storing database files, removed for non-persistent configs
+	AdditionalArgs []string // Additional arguments to pass to the postgres command
+}
+
 type PG struct {
-	dir string
-	cmd *exec.Cmd
-	DB  *sql.DB
+	dir  string
+	cmd  *exec.Cmd
+	Pool *pgxpool.Pool
 
 	Host string
 	User string
 	Name string
 
-	persistent bool
-
 	stderr io.ReadCloser
 	stdout io.ReadCloser
+}
+
+func postgresqlDBConf(sockDir string, dbName string) (*pgxpool.Config, error) {
+	url := "postgres://test@localhost/" + dbName + "?host=" + sockDir
+	return pgxpool.ParseConfig(url)
+}
+
+func createTestDB(ctx context.Context, pool *pgxpool.Pool) error {
+	var conn *pgxpool.Conn
+	// Prepare test database
+	err := retry(func() error {
+		var err error
+		conn, err = pool.Acquire(ctx)
+		return err
+	}, 1000, 10*time.Millisecond)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		conn.Release()
+	}()
+
+	if _, err := conn.Exec(ctx, "CREATE DATABASE test"); err != nil {
+		return err
+	}
+	return nil
 }
 
 // Start a new PostgreSQL database, on temporary storage.
@@ -41,68 +71,18 @@ type PG struct {
 // than your production database. This makes it less reliable in case of system
 // crashes, but we don't care about that anyway during unit testing.
 //
-// Use the DB field to access the database connection
-func Start() (*PG, error) {
-	return start(New())
-}
-
-// Starts a new PostgreSQL database
-//
-// Will listen on a unix socket and initialize the database in the given
-// folder, if needed. Data isn't removed when calling Stop(), so this database
-// can be used multiple times. Allows using PostgreSQL as an embedded databases
-// (such as SQLite). Not for production usage!
-func StartPersistent(folder string) (*PG, error) {
-	return start(New().DataDir(folder).Persistent())
-}
-
-// start Starts a new PostgreSQL database
-//
-// Will listen on a unix socket and initialize the database in the given
-// folder (config.Dir), if needed.
-// Data isn't removed when calling Stop() if config.Persistent == true,
-// so this database
-// can be used multiple times. Allows using PostgreSQL as an embedded databases
-// (such as SQLite). Not for production usage!
-func start(config *PGConfig) (*PG, error) {
+// Use the Pool field to access the database pool
+func Start(ctx context.Context, config Config) (*PG, error) {
 	// Find executables root path
 	binPath, err := findBinPath(config.BinDir)
 	if err != nil {
 		return nil, err
 	}
 
-	// Handle dropping permissions when running as root
-	me, err := user.Current()
-	if err != nil {
-		return nil, err
-	}
-	isRoot := me.Username == "root"
-
-	pgUID := int(0)
-	pgGID := int(0)
-	if isRoot {
-		pgUser, err := user.Lookup("postgres")
-		if err != nil {
-			return nil, fmt.Errorf("Could not find postgres user, which is required when running as root: %s", err)
-		}
-
-		uid, err := strconv.ParseInt(pgUser.Uid, 10, 64)
-		if err != nil {
-			return nil, err
-		}
-		pgUID = int(uid)
-
-		gid, err := strconv.ParseInt(pgUser.Gid, 10, 64)
-		if err != nil {
-			return nil, err
-		}
-		pgGID = int(gid)
-	}
-
 	// Prepare data directory
 	dir := config.Dir
 	if config.Dir == "" {
-		d, err := os.MkdirTemp("", "pgtest")
+		d, err := os.MkdirTemp("", "pgxtest")
 		if err != nil {
 			return nil, err
 		}
@@ -122,34 +102,14 @@ func start(config *PGConfig) (*PG, error) {
 		return nil, err
 	}
 
-	if isRoot {
-		err = os.Chmod(dir, 0711)
-		if err != nil {
-			return nil, err
-		}
-
-		err = os.Chown(dataDir, pgUID, pgGID)
-		if err != nil {
-			return nil, err
-		}
-
-		err = os.Chown(sockDir, pgUID, pgGID)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	// Initialize PostgreSQL data directory
-	_, err = os.Stat(filepath.Join(dataDir, "postgresql.conf"))
-	if os.IsNotExist(err) {
-		init := prepareCommand(isRoot, filepath.Join(binPath, "initdb"),
-			"-D", dataDir,
-			"--no-sync",
-		)
-		out, err := init.CombinedOutput()
-		if err != nil {
-			return nil, fmt.Errorf("Failed to initialize DB: %w -> %s", err, string(out))
-		}
+	init := prepareCommand(filepath.Join(binPath, "initdb"),
+		"-D", dataDir,
+		"--no-sync",
+		"--username=test",
+	)
+	out, err := init.CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("Failed to initialize DB: %w -> %s", err, string(out))
 	}
 
 	// Start PostgreSQL
@@ -162,7 +122,7 @@ func start(config *PGConfig) (*PG, error) {
 	if len(config.AdditionalArgs) > 0 {
 		args = append(args, config.AdditionalArgs...)
 	}
-	cmd := prepareCommand(isRoot, filepath.Join(binPath, "postgres"),
+	cmd := prepareCommand(filepath.Join(binPath, "postgres"),
 		args...,
 	)
 	stderr, err := cmd.StderrPipe()
@@ -181,36 +141,35 @@ func start(config *PGConfig) (*PG, error) {
 		return nil, abort("Failed to start PostgreSQL", cmd, stderr, stdout, err)
 	}
 
-	// Connect to DB
-	dsn := makeDSN(sockDir, "postgres", isRoot)
-	db, err := sql.Open("postgres", dsn)
+	// Connect to postgres DB
+	postgresConf, err := postgresqlDBConf(sockDir, "postgres")
 	if err != nil {
-		return nil, abort("Failed to connect to DB", cmd, stderr, stdout, err)
+		return nil, abort("Failed to create pgx pool config", cmd, stderr, stdout, err)
+	}
+	pool, err := pgxpool.NewWithConfig(ctx, postgresConf)
+	if err != nil {
+		return nil, abort("Failed to connect to postgres DB", cmd, stderr, stdout, err)
 	}
 
-	// Prepare test database
-	err = retry(func() error {
-		var exists bool
-		err = db.QueryRow("SELECT 1 FROM pg_database WHERE datname = 'test'").Scan(&exists)
-		if exists {
-			return nil
-		}
-
-		_, err := db.Exec("CREATE DATABASE test")
-		return err
-	}, 1000, 10*time.Millisecond)
-	if err != nil {
-		return nil, abort("Failed to prepare test DB", cmd, stderr, stdout, err)
+	if err := createTestDB(ctx, pool); err != nil {
+		return nil, abort("Failed to create test DB", cmd, stderr, stdout, err)
 	}
 
-	err = db.Close()
-	if err != nil {
-		return nil, abort("Failed to disconnect", cmd, stderr, stdout, err)
-	}
+	pool.Close()
 
 	// Connect to it properly
-	dsn = makeDSN(sockDir, "test", isRoot)
-	db, err = sql.Open("postgres", dsn)
+	testConf, err := postgresqlDBConf(sockDir, "test")
+	if err != nil {
+		return nil, abort("Failed to create pgx pool config", cmd, stderr, stdout, err)
+	}
+	testConf.ConnConfig.Tracer = &tracelog.TraceLog{
+		Logger: pgxslog.NewLogger(
+			// TODO (misha): change to a proper test logger
+			slog.Default(),
+		),
+		LogLevel: tracelog.LogLevelTrace,
+	}
+	pool, err = pgxpool.NewWithConfig(ctx, testConf)
 	if err != nil {
 		return nil, abort("Failed to connect to test DB", cmd, stderr, stdout, err)
 	}
@@ -219,13 +178,11 @@ func start(config *PGConfig) (*PG, error) {
 		cmd: cmd,
 		dir: dir,
 
-		DB: db,
+		Pool: pool,
 
 		Host: sockDir,
-		User: pgUser(isRoot),
+		User: "test",
 		Name: "test",
-
-		persistent: config.IsPersistent,
 
 		stderr: stderr,
 		stdout: stdout,
@@ -240,12 +197,12 @@ func (p *PG) Stop() error {
 		return nil
 	}
 
-	if !p.persistent {
-		defer func() {
-			// Always try to remove it
-			os.RemoveAll(p.dir)
-		}()
-	}
+	p.Pool.Close()
+
+	defer func() {
+		// Always try to remove it
+		os.RemoveAll(p.dir)
+	}()
 
 	err := p.cmd.Process.Signal(os.Interrupt)
 	if err != nil {
@@ -326,23 +283,6 @@ func findBinPath(binDir string) (string, error) {
 	return "", fmt.Errorf("Did not find PostgreSQL executables installed")
 }
 
-func pgUser(isRoot bool) string {
-	user := ""
-	if isRoot {
-		user = "postgres"
-	}
-	return user
-}
-
-func makeDSN(sockDir, dbname string, isRoot bool) string {
-	dsnUser := ""
-	user := pgUser(isRoot)
-	if user != "" {
-		dsnUser = fmt.Sprintf("user=%s", user)
-	}
-	return fmt.Sprintf("host=%s dbname=%s %s", sockDir, dbname, dsnUser)
-}
-
 func retry(fn func() error, attempts int, interval time.Duration) error {
 	for {
 		err := fn()
@@ -359,24 +299,8 @@ func retry(fn func() error, attempts int, interval time.Duration) error {
 	}
 }
 
-func prepareCommand(isRoot bool, command string, args ...string) *exec.Cmd {
-	var cmd *exec.Cmd
-	if !isRoot {
-		cmd = exec.Command(command, args...)
-	} else {
-		for i, a := range args {
-			if a == "" {
-				args[i] = "''"
-			}
-		}
-
-		cmd = exec.Command("su",
-			"-",
-			"postgres",
-			"-c",
-			strings.Join(append([]string{command}, args...), " "),
-		)
-	}
+func prepareCommand(command string, args ...string) *exec.Cmd {
+	cmd := exec.Command(command, args...)
 
 	cmd.Env = append(
 		os.Environ(),

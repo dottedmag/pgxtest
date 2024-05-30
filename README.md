@@ -1,16 +1,17 @@
-# pgtest
+# pgxtest
 
 > Go library to spawn single-use PostgreSQL servers for unit testing
 
-[![Build Status](https://github.com/rubenv/pgtest/workflows/Test/badge.svg)](https://github.com/rubenv/pgtest/actions) [![GoDoc](https://godoc.org/github.com/rubenv/pgtest?status.png)](https://godoc.org/github.com/rubenv/pgtest)
+[![Go Reference](https://pkg.go.dev/badge/github.com/dottedmag/pgxtest.svg)](https://pkg.go.dev/github.com/dottedmag/pgxtest)
 
-Spawns a PostgreSQL server with a single database configured. Ideal for unit
-tests where you want a clean instance each time. Then clean up afterwards.
+Spawns a PostgreSQL server with a single database configured, and returns a
+`*pgxpool.Pool`. Ideal for unit tests where you want a clean instance each time.
+Then clean up afterwards.
 
 Features:
 
 * Starts a clean isolated PostgreSQL database
-* Tested on Fedora, Ubuntu and Alpine
+* Returns `*pgxconn.Pool`, not a `database/sql` connection.
 * Optimized for in-memory execution, to speed up unit tests
 * Less than 1 second startup / initialization time
 * Automatically drops permissions when testing as root
@@ -19,10 +20,10 @@ Features:
 
 In your unit test:
 ```go
-pg, err := pgtest.Start()
+pg, err := pgxtest.Start()
 defer pg.Stop()
 
-// Do something with pg.DB (which is a *sql.DB)
+// Do something with pg.Pool (which is a *pgxpool.Pool)
 ```
 
 ## License
